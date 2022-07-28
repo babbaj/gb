@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -47,7 +46,7 @@ type Restoration struct {
 	sourcesOnDisk map[string]int64 // path to fsModified
 }
 
-func Restore(src string, dest string, timestamp int64) {
+func Restore(src string, dest string, timestamp int64, hardlinkDedupe bool) {
 	// concept: restore a directory
 	// src is where the directory was (is, in the database)
 	// dest is where the directory should be
@@ -147,7 +146,7 @@ func Restore(src string, dest string, timestamp int64) {
 	log.Println()
 	log.Println(description)
 	cnt := 0
-	for _, item := range items {
+	/*for _, item := range items {
 		line := ""
 
 		if utils.IsDatabaseFile(item.origPath) || utils.IsDatabaseFile(item.destPath) {
@@ -175,7 +174,7 @@ func Restore(src string, dest string, timestamp int64) {
 		line += ", "
 		line += hex.EncodeToString(item.hash)
 		log.Println(line)
-	}
+	}*/
 	log.Println(description)
 	log.Println()
 	log.Println("^ There's a list of where paths would be restored from/to. Look good?")
@@ -217,6 +216,7 @@ func Restore(src string, dest string, timestamp int64) {
 	}
 	log.Println("Okay that was all database stuff, now I will stat your disk to see how much is already in place, how much I can pull from other files, and how much needs to be downloaded from storage")
 	statSources(plan)
+	//log.Println("skiping statSources")
 	cnt = 0
 	cnt2 := 0
 	for _, r := range plan {
@@ -246,7 +246,7 @@ func Restore(src string, dest string, timestamp int64) {
 	log.Println("Confirm? (yes: enter, no: ctrl+c) >")
 	bufio.NewReader(os.Stdin).ReadString('\n')
 	for _, r := range plan {
-		execute(*r)
+		execute(*r, hardlinkDedupe)
 	}
 }
 
@@ -257,72 +257,106 @@ func min(x, y int) int {
 	return y
 }
 
-func execute(rest Restoration) {
+func execute(rest Restoration, hardlinkDedupe bool) {
 	paths := make([]string, 0)
 	for path, _ := range rest.destinations {
 		paths = append(paths, path)
 	}
-	// To avoid potentially exhausting the open file limit, write to up to 500 files at a time.
-	// After the first 500 files are restored, one will be chosen as the source of data for the next 500 files.
-	diskSource := rest.nominatedSource
-	for i := 0; i < len(paths); i += 500 {
-		chunk := paths[i:min(len(rest.destinations), i+500)]
-		handles := make([]*os.File, 0)
-		writers := make([]io.Writer, 0)
-		for _, path := range chunk {
-			dir := filepath.Dir(path)
-			mode := rest.destinations[path].permissions
+	if !hardlinkDedupe {
+		// To avoid potentially exhausting the open file limit, write to up to 500 files at a time.
+		// After the first 500 files are restored, one will be chosen as the source of data for the next 500 files.
+		diskSource := rest.nominatedSource
+		for i := 0; i < len(paths); i += 500 {
+			chunk := paths[i:min(len(rest.destinations), i+500)]
+			execute0(rest, diskSource, chunk)
+			diskSource = &chunk[0]
+		}
+	} else {
+		// only 1 path
+		chunk := paths[:1]
+		execute0(rest, rest.nominatedSource, chunk)
+		otherPaths := paths[1:]
+		log.Println("Hard linking", len(otherPaths), "paths to", chunk[0])
+		hardLinkPaths(chunk[0], rest, otherPaths)
+		log.Println("Done")
+	}
+}
 
-			// https://stackoverflow.com/a/31151508/2277831
-			dirMode := mode               // start with perms of the file
-			dirMode |= (mode >> 2) & 0111 // for group and other, allow execute (dir read) if they can read
-			dirMode |= 0700               // we must have full access no matter what, otherwise this recursive mkdir won't work in the first place
+func execute0(rest Restoration, diskSource *string, paths []string) {
+	handles := make([]*os.File, 0)
+	writers := make([]io.Writer, 0)
+	for _, path := range paths {
+		dir := filepath.Dir(path)
+		mode := rest.destinations[path].permissions
 
-			log.Println("mkdir", dir, "with original", mode, "overridden to", dirMode)
-			err := os.MkdirAll(dir, dirMode)
-			if err != nil {
-				panic(err)
-			}
+		// https://stackoverflow.com/a/31151508/2277831
+		dirMode := mode               // start with perms of the file
+		dirMode |= (mode >> 2) & 0111 // for group and other, allow execute (dir read) if they can read
+		dirMode |= 0700               // we must have full access no matter what, otherwise this recursive mkdir won't work in the first place
 
-			log.Println("open", path, "for write")
-			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-			if err != nil {
-				panic(err)
-			}
-			handles = append(handles, f)
-			writers = append(writers, f)
+		log.Println("mkdir", dir, "with original", mode, "overridden to", dirMode)
+		err := os.MkdirAll(dir, dirMode)
+		if err != nil {
+			panic(err)
 		}
 
-		out := io.MultiWriter(writers...)
-
-		hs := utils.NewSHA256HasherSizer()
-		out = io.MultiWriter(out, &hs)
-
-		var src io.Reader
-		if diskSource == nil {
-			log.Println("Fetching from storage")
-			src = CatEz(rest.hash)
-		} else {
-			log.Println("Reading locally, from", *diskSource)
-			f, err := os.Open(*diskSource)
-			if err != nil {
-				panic(err)
-			}
-			defer f.Close()
-			src = f
+		log.Println("open", path, "for write")
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+		if err != nil {
+			panic(err)
 		}
-		utils.Copy(out, src)
-		log.Println("Expecting size and hash:", rest.size, hex.EncodeToString(rest.hash))
-		hash, size := hs.HashAndSize()
-		log.Println("Got size and hash:", size, hex.EncodeToString(hash))
-		if size != rest.size || !bytes.Equal(hash, rest.hash) {
-			panic("wrong")
-		}
-		log.Println("Success")
-		diskSource = &chunk[0]
+		handles = append(handles, f)
+		writers = append(writers, f)
+	}
 
-		for _, f := range handles {
-			f.Close()
+	out := io.MultiWriter(writers...)
+
+	hs := utils.NewSHA256HasherSizer()
+	out = io.MultiWriter(out, &hs)
+
+	var src io.Reader
+	if diskSource == nil {
+		log.Println("Fetching from storage")
+		src = CatEz(rest.hash)
+	} else {
+		log.Println("Reading locally, from", *diskSource)
+		f, err := os.Open(*diskSource)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		src = f
+	}
+	utils.Copy(out, src)
+	log.Println("Expecting size and hash:", rest.size, hex.EncodeToString(rest.hash))
+	hash, size := hs.HashAndSize()
+	log.Println("Got size and hash:", size, hex.EncodeToString(hash))
+	if size != rest.size || !bytes.Equal(hash, rest.hash) {
+		panic("wrong")
+	}
+	log.Println("Success")
+
+	for _, f := range handles {
+		f.Close()
+	}
+}
+
+func hardLinkPaths(source string, rest Restoration, paths []string) {
+	for _, path := range paths {
+		mode := rest.destinations[path].permissions
+		// pasted from above lol
+		dirMode := mode
+		dirMode |= (mode >> 2) & 0o111 // octal
+		dirMode |= 0700
+		dir := filepath.Dir(path)
+		err := os.MkdirAll(dir, dirMode)
+		if err != nil {
+			panic(err)
+		}
+
+		err = os.Link(source, path)
+		if err != nil {
+			panic(err)
 		}
 	}
 }
@@ -356,7 +390,7 @@ func statSources(plan map[[32]byte]*Restoration) {
 		}
 		return paths[i] < paths[j]
 	})
-	log.Println(paths)
+	//log.Println(paths) // poz
 	for _, path := range paths {
 		key := sources[path]
 		if _, ok := sourceVerified[key]; ok {
