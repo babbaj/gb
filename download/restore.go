@@ -221,7 +221,7 @@ func Restore(src string, dest string, timestamp int64, hardlinkDedupe bool) {
 	cnt2 := 0
 	for _, r := range plan {
 		if len(r.destinations) == 0 {
-			panic("failed")
+			//panic("failed")
 		}
 		if len(r.sourcesOnDisk) == 0 {
 			for _, d := range r.destinations {
@@ -246,7 +246,9 @@ func Restore(src string, dest string, timestamp int64, hardlinkDedupe bool) {
 	log.Println("Confirm? (yes: enter, no: ctrl+c) >")
 	bufio.NewReader(os.Stdin).ReadString('\n')
 	for _, r := range plan {
-		execute(*r, hardlinkDedupe)
+		if len(r.destinations) > 0 {
+			execute(*r, hardlinkDedupe)
+		}
 	}
 }
 
@@ -314,7 +316,7 @@ func execute0(rest Restoration, diskSource *string, paths []string) {
 	hs := utils.NewSHA256HasherSizer()
 	out = io.MultiWriter(out, &hs)
 
-	var src io.Reader
+	var src io.ReadCloser
 	if diskSource == nil {
 		log.Println("Fetching from storage")
 		src = CatEz(rest.hash)
@@ -328,6 +330,10 @@ func execute0(rest Restoration, diskSource *string, paths []string) {
 		src = f
 	}
 	utils.Copy(out, src)
+	//err := src.Close()
+	//if err != nil {
+	//	panic(err)
+	//}
 	log.Println("Expecting size and hash:", rest.size, hex.EncodeToString(rest.hash))
 	hash, size := hs.HashAndSize()
 	log.Println("Got size and hash:", size, hex.EncodeToString(hash))
@@ -427,6 +433,32 @@ func statSources(plan map[[32]byte]*Restoration) {
 	// at this point, there is no overlap between sourcesOndisk and destinations for any restoration
 	for _, hash := range completedRestorationDestinations(plan) {
 		delete(plan, hash)
+	}
+
+	// stat the remaining destination paths and remove them if they already exist
+	destPaths := make([]string, 0)
+	for _, rest := range plan {
+		for _, item := range rest.destinations {
+			destPaths = append(destPaths, item.destPath)
+		}
+	}
+	sort.Slice(destPaths, func(i, j int) bool {
+		return destPaths[i] < destPaths[j]
+	})
+	existingDestCount := 0
+	for _, path := range destPaths {
+		key := destinations[path]
+		restoration := plan[key]
+		_, err := os.Stat(path)
+		// if it exists
+		if err == nil {
+			// delete if from the plan
+			delete(restoration.destinations, path)
+			existingDestCount++
+		}
+	}
+	if existingDestCount > 0 {
+		log.Println(existingDestCount, "destination paths already exist and will not be written to")
 	}
 }
 
