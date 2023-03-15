@@ -3,7 +3,6 @@ package utils
 import (
 	"crypto/md5"
 	"crypto/sha256"
-	ignore "github.com/sabhiram/go-gitignore"
 	"hash"
 	"io"
 	"io/fs"
@@ -111,7 +110,7 @@ func findGitignore(ls []fs.DirEntry) int {
 
 type ignoreWrapper struct {
 	basePath string
-	*ignore.GitIgnore
+	*GitIgnore
 }
 
 func isIgnored(absPath string, isDir bool, gitIgnores []ignoreWrapper) bool {
@@ -142,7 +141,7 @@ func walkFiles(startPath string, path string, gitIgnores []ignoreWrapper, filesC
 		gitignoreIdx := findGitignore(ls)
 		if gitignoreIdx != -1 {
 			gitignorePath := path + "/.gitignore"
-			gitignore, err := ignore.CompileIgnoreFile(gitignorePath)
+			gitignore, err := CompileIgnoreFile(gitignorePath)
 			err = filterFsErr(gitignorePath, err) // most likely not necessary
 			if err != nil {
 				panic(err)
